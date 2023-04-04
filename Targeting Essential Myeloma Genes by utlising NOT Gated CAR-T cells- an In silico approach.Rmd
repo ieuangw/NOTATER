@@ -1,0 +1,865 @@
+---
+title: "Targeting Essential Myeloma Genes by utlising NOT Gated CAR-T cells- an In silico approach"
+output: html_notebook
+---
+
+
+# Introduction
+
+
+
+# Packages
+
+```{r}
+library(readr)
+library(dplyr)
+library(biomaRt)
+library(UniProt.ws)
+library(readxl)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+```
+
+# Functions 
+
+```{r}
+splitvec <- function(vector, split, select, merge = "_"){
+  processed <- sapply(vector, function(x){
+    separated <- unlist(strsplit(x, split = split))[select]
+    if (length(separated) > 1){
+      return(paste(separated, collapse = merge))
+    } else
+      return(separated)
+  })
+  processed <- unname(processed)
+  return(processed)
+}
+
+```
+
+
+# Identifying the Myeloma Depenent genes
+
+First we need to identify the depenent genes based on the DEPMAP. 
+
+```{r message=FALSE, warning=FALSE}
+
+#Load the DepMap
+CRISPRGeneDependency <- read_csv("~/Library/CloudStorage/GoogleDrive-igw24@cam.ac.uk/Shared drives/Chapman lab /Personal folders/Yaz/DEPMAP/CRISPR_chronos.csv")
+#Load the cell descriptors 
+colnames(CRISPRGeneDependency)[1] <- "ModelID"
+
+cell_line_info <- read_csv("~/Library/CloudStorage/GoogleDrive-igw24@cam.ac.uk/Shared drives/Chapman lab /Personal folders/Yaz/DEPMAP/Model.csv")
+
+#filter just the myeloma cells 
+cell_line_info <- cell_line_info %>% filter(OncotreeSubtype == "Plasma Cell Myeloma" )
+
+# Select the rows corresponding to myeloma cells 
+
+MM_dep <- CRISPRGeneDependency %>% filter( ModelID %in% as.list(cell_line_info$ModelID )) %>% t(.)
+
+#write the cell lines to colnames
+colnames(MM_dep) <- t(MM_dep[1,])
+MM_dep <- MM_dep[-1,] 
+
+rns <- rownames(MM_dep)
+
+MM_dep <- apply(MM_dep, 2,as.numeric)
+MM_dep <- as.data.frame(MM_dep)
+
+#write the gene names to rownames
+rownames(MM_dep) <- rns
+rm(CRISPRGeneDependency)
+
+#Change the cell line names to conventional names 
+
+colns <- data.frame(ModelID =  colnames(MM_dep))
+colns <- left_join(colns, cell_line_info, by = c("ModelID" = "ModelID"))
+colnames(MM_dep) <- colns$StrippedCellLineName
+
+#write file out
+# not run ## write.csv(MM_dep, "~/Documents/Chapman_work/MM_cell_lines_DEPMAP.csv")
+
+#This returns a list of all genes with the dependency.  Next we need to filtre for PMP proteins that have an extracellular domain 
+
+```
+
+# Getting PMP proteins that have an extracellular domain. 
+
+```{r message=FALSE, warning=FALSE}
+PrimaryPlasmaCells_Final <- read_excel("~/Library/CloudStorage/GoogleDrive-igw24@cam.ac.uk/Shared\ drives/Chapman\ lab\ /PMP\ paper/Datafiles/PrimaryPlasmaCells_Final.xlsx")
+
+#This gene causes errors- lets remove it
+PrimaryPlasmaCells_Final <- dplyr::filter(PrimaryPlasmaCells_Final, Accession != "Q9P2E9-2")
+
+# Use TxDB and Uniprot to get a map of proteins IDs and the ECM data
+hs <- UniProt.ws(taxId=9606)
+df <-  data.frame(keytypes(hs))
+
+columns <- c(  "length", "xref_pdb", "xref_hgnc", "ft_topo_dom", "feature_count","ft_domain", "ft_region", "cc_domain")
+kt <- "UniProtKB"
+res <- UniProt.ws::select(hs, PrimaryPlasmaCells_Final$Accession, columns, kt)
+PMP_uniprot_bind <- left_join(PrimaryPlasmaCells_Final,res, by = c("Accession" = "Entry") )
+
+#Get only genes with an annotated extracellular domain 
+PMP_uniprot_filtered <- subset(PMP_uniprot_bind, grepl("Extracellular", PMP_uniprot_bind$Topological.domain))
+# Now add the Ensembl gene ids
+
+mart <-  useEnsembl(biomart='ensembl', dataset= "hsapiens_gene_ensembl", mirror = "asia")
+
+
+gene_ids <- PMP_uniprot_filtered$`Gene ID`
+attributes <- c("ensembl_gene_id","hgnc_symbol" )
+converted_ids <- getBM(attributes = attributes, filters = "hgnc_symbol", values = gene_ids, mart = mart)
+
+PMP_uniprot_filtered_ensemblID <- left_join(PMP_uniprot_filtered, converted_ids, by= c("Gene ID" = "hgnc_symbol") )
+
+#subset the PMP file for just the domains and the ID
+ecl <- data.frame(ID = PMP_uniprot_filtered$`Gene ID`, tosplit = PMP_uniprot_filtered$Topological.domain)
+
+# split the domins by TOPO_DOM - this seperates in extraceullar and cytoplasmic 
+hh <-  tidyr::separate(ecl, "tosplit",into = paste("col", 1:18, sep= "_")  ,sep = "TOPO_DOM" )
+
+# remove all the cytoplasmic regions and replace with NA
+df_new <- as.data.frame(lapply(hh, function(x) {
+  sapply(x, function(y) {
+    ifelse(grepl("Cytoplasmic", y), "NA", y)
+  })
+}))
+
+
+
+# get the column names which we want to calculate length on 
+col_list <- paste("col", 2:18, sep= "_")
+
+for(i in 1:length(col_list)){
+  ipt <- df_new[,col_list[i]]
+  hold  <- splitvec( splitvec(ipt , "\\..", select = 1:2, merge = "_"), ";", 1) # splits the vector by .. and removes everything but the numbers merged together by _
+  n <- strsplit(hold, "_")  # split on _
+  n <-  suppressWarnings( sapply(n, function(x){ as.numeric(x[2]) - as.numeric(x[1])})) # substract the larger from the lower
+  df_new[,col_list[i]] <- n # replace column 
+  }
+
+
+df_new[, "largest_extracellular_domain_length"] <-  apply(df_new[, 3:19], 1, function(x){max(x, na.rm = TRUE)})
+
+df_new <- data.frame( "Gene ID" = df_new$ID,  largest_extracellular_domain_length = df_new$largest_extracellular_domain_length)
+
+PMP_uniprot_filtered <- left_join(PMP_uniprot_filtered, df_new, by=  c(`Gene ID` = "Gene.ID"))
+
+# Now add the Ensembl gene ids
+
+
+gene_ids <- PMP_uniprot_filtered$`Gene ID`
+attributes <- c("ensembl_gene_id","hgnc_symbol" )
+converted_ids <- getBM(attributes = attributes, filters = "hgnc_symbol", values = gene_ids, mart = mart)
+
+PMP_uniprot_filtered_ensemblID <- left_join(PMP_uniprot_filtered, converted_ids, by= c("Gene ID" = "hgnc_symbol") )
+
+# Now subset the DEPMAP data to select only genes that are present in the PMP with an ECD.
+
+MM_dep <- MM_dep[rownames(MM_dep) %in% PMP_uniprot_filtered_ensemblID$`Gene ID`, ]
+
+#  now filter the essential genes, based on average effect less than -0.2 .
+
+MM_dep$Essential <- rowMeans(MM_dep) 
+
+
+
+MM_dep.save <- MM_dep
+```
+
+# Make a plot of all essential genes
+
+```{r}
+
+mm_ess_df <- data.frame( gene=  rownames(MM_dep), Essentialiaty =   MM_dep$Essential )
+
+ggplot(mm_ess_df, aes(x = reorder(gene, Essentialiaty), y = Essentialiaty, color = Essentialiaty < -0.25)) +
+  geom_point() +
+  ylim(-1, 1) +
+  geom_abline(intercept = -0.25, slope = 1, linetype = "dashed") +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "black")) +
+  labs(title = "Myeloma Target Essentiality", x = "Genes", y = "Score") +
+  theme(axis.text.x = element_blank(), axis.title.x = element_blank())
+
+
+
+
+
+MM_dep_Essential <- MM_dep %>% filter (., Essential <(2))
+```
+
+# Ranking best targets
+
+Using the PMP expression data and the essnetiality we want to find the most negative gene. 
+To plot this 
+
+```{r}
+MM_dep <- MM_dep %>% tibble::rownames_to_column()
+
+MM_dep$log_ess<- log2(MM_dep$Essential+3) # give a linear plot of essentiality 
+
+
+MM_pmp_exp <- data.frame( geneID= PMP_uniprot_filtered_ensemblID$`Gene ID`, expression =  log2(rowMeans(PMP_uniprot_filtered_ensemblID[20:27], na.rm = TRUE)+1))
+
+#Merge the PMP with essentiality to get the values.
+MM_dep_PMP <- left_join(MM_dep, MM_pmp_exp, by= c("rowname"= "geneID" )  ) %>%distinct()
+
+
+
+# plot the normalised expression vs the essentiality score 
+
+plot( MM_dep_PMP$Essential, MM_dep_PMP$expression)
+
+
+MM_dep_PMP$score <- MM_dep_PMP$Essential * MM_dep_PMP$expression
+
+ggplot(MM_dep_PMP, aes(x = reorder(rowname, score), y = score)) + 
+  geom_point() +
+  labs(title = "Myeloma Target Essentiality", x = "Genes", y = "Myeloma Immotheraputic Score") +
+  theme(axis.text.x = element_blank())
+
+
+```
+
+
+
+
+# Demonstrating that there are no myeloma essential gene immunotheraputic targets at a protein level. 
+
+Filtering the DEP map by myeloma essential genes which have an Extraceullar domain 
+Using the Human Proteome Map to generate a heatmap of all the targets with an extraceullar domain that are clean myeloma targets. 
+
+```{r message=FALSE, warning=FALSE}
+
+# Load the HPM data
+HPM_gene_level_exp <- read_csv("~/Library/CloudStorage/GoogleDrive-igw24@cam.ac.uk/Shared drives/Chapman lab /Personal folders/Yaz/Human_proteome_map/HPM_gene_level_epxression_matrix_Kim_et_al_052914.csv")
+
+# Remove the embryonic tissue 
+Tissue_gene_level_exp <- HPM_gene_level_exp[,c(1,8:31)]
+Tissue_gene_level_exp.master <- Tissue_gene_level_exp
+
+# Select only genes with essential expression < - 0.25
+
+
+MM_dep_Essential <- MM_dep %>% filter (., Essential <(-0.25))
+
+# filter to select only PMPs with extraceullar domain that are essential in myeloma 
+Tissue_gene_level_exp  <- Tissue_gene_level_exp %>% dplyr::filter (Gene %in% as.list(MM_dep_Essential$rowname))
+rns <- Tissue_gene_level_exp$Gene
+Tissue_gene_level_exp <- Tissue_gene_level_exp[,-1]
+Tissue_gene_level_exp_mat <- as.matrix(Tissue_gene_level_exp)
+rownames(Tissue_gene_level_exp_mat) <- rns
+#CD30 is not annotated in the human proteome map ,we know this is expressed on a number of tissues it has been removed here. 
+Tissue_gene_level_exp_mat <- Tissue_gene_level_exp_mat[!(row.names(Tissue_gene_level_exp_mat) == c("TNFRSF8", "HLA-C" )),]
+
+
+
+```
+
+```{r}
+# Make heatmap for paper
+
+library(ggplot2)
+library(hrbrthemes)
+library(reshape2)
+library(viridis)
+
+heatmap_input <- melt(Tissue_gene_level_exp_mat)
+
+ggplot(heatmap_input, aes(Var2, Var1, fill= log2(value))) + 
+  geom_tile() +
+  scale_fill_viridis(discrete=FALSE) +
+  theme_ipsum() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+
+```
+
+```{r}
+
+```
+
+
+
+
+``` {r}
+Tissue_gene_level_exp_mat <- as.data.frame(Tissue_gene_level_exp_mat)
+
+# optional filter to remove all targets on T cells 
+Tissue_gene_level_exp_mat.tcell_filter <- Tissue_gene_level_exp_mat %>% dplyr::filter(`CD4 Cells` == 0) %>% dplyr::filter(`CD8 Cells` == 0) # saved for later
+```
+
+# make the T cell HPM dataframe for later
+```{r}
+T_cell_proteins  <- data.frame(gene =  HPM_gene_level_exp$Gene, CD4 = HPM_gene_level_exp$`CD4 Cells`, CD8 = HPM_gene_level_exp$`CD8 Cells`) 
+
+T_genes <-T_cell_proteins %>% filter(CD4 > 0) %>% filter(CD8 >0)
+
+
+```
+
+
+
+Based on this we are unable to target MM using monoclonal targets. To prevent the off target effects we now need to find NOT gate combinations.
+This means we are targeting one of these PMP but that the other target is Absent in MM but is present on all other tissues. 
+
+```{r}
+# Find Plasma membrane proteins that are NOT expressed in Myeloma. Using a TxDB binding
+
+# Get the UNiprot IDs from the HPM_gene_level_exp
+ 
+library(biomaRt)
+
+# Key for ensembl to gene ID 
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_ids <- HPM_gene_level_exp$Gene 
+attributes <- c("hgnc_symbol", "uniprotswissprot")
+converted_ids <- getBM(attributes = attributes, filters = "hgnc_symbol", values = gene_ids, mart = mart)
+
+converted_ids[converted_ids == ""] <- NA
+converted_ids <- converted_ids %>% drop_na()
+
+#Get all annotated proteins the HPM 
+
+columns <- c( "gene_primary", "length", "xref_pdb", "xref_hgnc", "ft_topo_dom", "feature_count","ft_domain", "ft_region", "cc_domain")
+kt <- "UniProtKB"
+hs <- UniProt.ws(taxId=9606)
+res <- UniProt.ws::select(hs, converted_ids$uniprotswissprot, columns, kt)
+
+# Remove all proteins found in the myeloma PMP
+
+Proteome_minus_myelomaPMP <- res %>% dplyr::filter(! res$Gene.Names..primary. %in% as.list(PMP_uniprot_filtered_ensemblID$`Gene ID`))
+
+#####################
+###Remove all proteins without an Extracellular Domain 
+
+
+#subset the PMP file for just the domains and the ID
+ecl <- data.frame(ID = Proteome_minus_myelomaPMP$Gene.Names..primary., tosplit = Proteome_minus_myelomaPMP$Topological.domain)
+
+# split the domins by TOPO_DOM - this seperates in extraceullar and cytoplasmic 
+hh <-  suppressWarnings( tidyr::separate(ecl, "tosplit",into = paste("col", 1:30 ,sep= "_")  ,sep = "TOPO_DOM" ))
+
+# remove all the cytoplasmic regions and replace with NA
+df_new <- as.data.frame(lapply(hh, function(x) {
+  sapply(x, function(y) {
+    ifelse(grepl("Cytoplasmic|Lumenal|Mitochondrial|Nuclear|Peroxisomal|Vesicular|Perinuclear|Exoplasmic", y), "NA", y)
+  })
+}))
+
+
+
+# get the column names which we want to calculate length on 
+col_list <- paste("col", 1:30, sep= "_")
+
+for(i in 1:length(col_list)){
+  ipt <- df_new[,col_list[i]]
+  hold  <- splitvec( splitvec(ipt , "\\..", select = 1:2, merge = "_"), ";", 1) # splits the vector by .. and removes everything but the numbers merged together by _
+  n <- strsplit(hold, "_")  # split on _
+  n <-  suppressWarnings( sapply(n, function(x){ as.numeric(x[2]) - as.numeric(x[1])})) # substract the larger from the lower
+  df_new[,col_list[i]] <- n # replace column 
+  }
+
+
+df_new[, "largest_extracellular_domain_length"] <-  suppressWarnings( apply(df_new[, 3:31], 1, function(x){max(x, na.rm = TRUE)}))
+
+Proteins_with_ECD <-  data.frame( "Gene ID" = df_new$ID,  largest_extracellular_domain_length = df_new$largest_extracellular_domain_length) %>% dplyr::filter(largest_extracellular_domain_length > 0)
+
+# Make a NOT target list from the HPM
+#This is the expression of proteins NOT in the myeloma PMP but are plasma membrane proteins. 
+NOT_HPM <- HPM_gene_level_exp[,c(1,8:31)]
+
+NOT_HPM <- NOT_HPM %>% dplyr::filter(Gene %in% as.list(Proteins_with_ECD$Gene.ID))
+
+```
+
+# Logic gating to select NOT Gate
+This part will select Essential myeloma gene AND a gene that is expressed on other tissue IF the myeloma essential target is also expressed there
+
+
+```{r message=FALSE, warning=FALSE}
+
+gene_not_master <- data.frame(Target_gene = as.character(),NOT_gene = as.character() )
+
+goi.all <- rownames(Tissue_gene_level_exp_mat)
+
+
+
+# Get all the possile on targets:
+
+On_target <- data.frame(gene_target= PMP_uniprot_filtered_ensemblID$`Gene ID`) %>% distinct()
+
+#get expression on other tissue
+On_target_tissue <-  Tissue_gene_level_exp.master %>% dplyr::filter(Gene %in% as.list(On_target$gene_target))
+
+On_target_tissue[,2:25 ][On_target_tissue[,2:25 ] > 0] <- 100
+
+#get all possible NOT combos
+#these have an extra cellular domain and are annotated that way
+NOT_HPM.input <- NOT_HPM %>% dplyr::filter(!Gene %in% as.list(On_target$gene_target))
+NOT_HPM.input[,2:25 ][NOT_HPM.input[,2:25 ] > 0] <- 100
+
+
+check_rows <- function(row1, row2) {
+  if (row1 == 0) {
+    return("Yes")
+  } else if (row1 == 100 & row2 == 100) {
+    return("Yes")
+  } else if(row1 == 100 & row2 == 0){
+    return("No")
+  } else {
+    return("No")
+  }
+}
+
+check_all_rows <- function(df, row1_idx, row2_idx) {
+  rows1 <- df[row1_idx, 1:24]
+  rows2 <- df[row2_idx, 1:24]
+  all_results <- sapply(1:24, function(i) {
+    check_rows(rows1[i], rows2[i])
+  })
+  
+  if (all(all_results == "Yes")) {
+    return("Yes")
+  } else {
+    return("No")
+  }
+}
+
+Not_gate_dataframe <- data.frame(Target_gene = character() ,not_gate =character()  , filter= character() )
+
+for(i in 1:nrow(On_target_tissue)){ 
+On_target_gene <- On_target_tissue[i,]
+for(j in 1:nrow(NOT_HPM.input)){
+input <- rbind(On_target_gene[1,], NOT_HPM.input[j,])
+target <- On_target_gene$Gene[1]
+not <- NOT_HPM.input[j,]$Gene
+input <- input[,-1]
+Valid <- check_all_rows(input,1,2)
+
+to_bind <- data.frame(Target_gene =target , not_gate= not , filter = Valid  )
+Not_gate_dataframe <- rbind(Not_gate_dataframe, to_bind )}
+}
+
+save(Not_gate_dataframe, file = "~/Documents/Chapman_work/Not_gate_dataframe.RData")
+
+```
+##############
+
+```{# not run r } 
+# legacy code
+
+
+for (i in 1:length(goi.all)){
+  
+  
+goi <- goi.all[i]
+
+GOI_tissue <- Tissue_gene_level_exp_mat[goi,]
+
+Not_gate_data_frame <- data.frame (matrix(nrow =1 , ncol =1))
+
+
+  for (j in 1:ncol(GOI_tissue)) {
+    GOI_tissue[j]
+  val <- GOI_tissue[1, j]
+  if (val == 0) {
+    safe.df <- data.frame(tissue = "SAFE")
+    colnames(safe.df) <- colnames(GOI_tissue)[j]
+    Not_gate_data_frame <- cbind(Not_gate_data_frame, safe.df) 
+  } else {
+    not.genes <- NOT_HPM %>% dplyr::filter(!!as.name(colnames(GOI_tissue)[j]) > 0.0)
+    safe.not.df <- data.frame(tissue = not.genes$Gene)
+    colnames(safe.not.df) <- colnames(GOI_tissue)[j]
+    if (nrow(safe.not.df) > nrow(Not_gate_data_frame)) {
+      add_ons <- matrix(nrow = nrow(safe.not.df) - nrow(Not_gate_data_frame), ncol = ncol(safe.not.df))
+      colnames(add_ons) <- colnames(safe.not.df)
+      safe.not.df <- rbind(safe.not.df, add_ons)
+    } else if (nrow(safe.not.df) < nrow(Not_gate_data_frame)) {
+      add_ons <- matrix(nrow = nrow(Not_gate_data_frame) - nrow(safe.not.df), ncol = ncol(safe.not.df))
+      colnames(add_ons) <- colnames(safe.not.df)
+      add_ons <- rbind(add_ons, safe.not.df)
+      safe.not.df <- add_ons
+    }
+    Not_gate_data_frame <- cbind(Not_gate_data_frame, safe.not.df)
+  }
+}
+  Not_gate_data_frame <- Not_gate_data_frame[,2:ncol(Not_gate_data_frame)]
+ xxx  <- Not_gate_data_frame[ ,  !str_detect(Not_gate_data_frame, "SAFE")]
+unique_strings <- unique(unlist(xxx))
+if(length(unique_strings) == 0) { 
+gene_not_combos <- data.frame(Target_gene =  goi, NOT_gene = NA )
+gene_not_master <- rbind(gene_not_master ,gene_not_combos)
+}else{
+  gene_not_combos <- data.frame(Target_gene =  goi, NOT_gene = unique_strings )
+  gene_not_master <- rbind(gene_not_master ,gene_not_combos)
+}
+ 
+}
+ 
+#This returns a large dataframe with two columns the Target gene and the NOT Gate
+
+# save the dataframe 
+# save(gene_not_master, file = "Documents/Chapman_work/myeloma_not_gate_master.RData")
+
+
+#### functions
+
+check_rows <- function(row1, row2) {
+  if (row1 == 0) {
+    return("Yes")
+  } else if (row1 == 100 & row2 == 100) {
+    return("Yes")
+  } else if(row1 == 100 & row2 == 0){
+    return("No")
+  } else {
+    return("No")
+  }
+}
+
+check_all_rows <- function(df, row1_idx, row2_idx) {
+  rows1 <- df[row1_idx, 1:24]
+  rows2 <- df[row2_idx, 1:24]
+  all_results <- sapply(1:24, function(i) {
+    check_rows(rows1[i], rows2[i])
+  })
+  
+  if (all(all_results == "Yes")) {
+    return("Yes")
+  } else {
+    return("No")
+  }
+}
+
+gene_not_master$Filter <- 0
+gene_not_master <- na.omit(gene_not_master)
+# Find the NOT combos that are expressed in every tissue the targets are
+combo_genes <- HPM_gene_level_exp[,c(1,8:31)]
+combo_genes[,2:25 ][combo_genes[,2:25 ] > 0] <- 100
+
+for(i in 1:nrow(gene_not_master)){
+tp <- gene_not_master[i,]
+test.target <- combo_genes %>% dplyr::filter(Gene ==  tp$Target_gene)
+test.NOT <- combo_genes %>% dplyr::filter(Gene ==  tp$NOT_gene)
+test.pair <- rbind(test.target,test.NOT)
+test.pair <- test.pair[,-1]
+gene_not_master$Filter[i] <- check_all_rows(test.pair, 1, 2)
+}
+
+
+
+#data saved
+save(gene_not_master, file ="~gene_not_master.RData")
+
+
+```
+
+
+# Annotating the NOT gate datafrme 
+
+we can get the extracellular lenghts for the NOT targets from the work above, similarly we have already caculated the largest extraceullar domain of the primary targets 
+
+```{r}
+load("~/Documents/Chapman_work/Not_gate_dataframe.RData")
+
+# filter by NOT gates that pass the check - ie are expressed in all tissue that the target is 
+
+Not_gate_dataframe.filt <- Not_gate_dataframe %>% dplyr::filter(., filter == "Yes" )
+Not_gate_dataframe.filt.ess <- Not_gate_dataframe.filt %>% dplyr::filter(.,Target_gene %in% as.list((filter(MM_dep, Essential <(-0.25)))[,1]) )
+
+
+
+# get the Extra celluar domain lengths for our targets
+
+MM_targets <- data.frame(gene = PMP_uniprot_filtered$`Gene ID`, Target_ECD_length = PMP_uniprot_filtered$largest_extracellular_domain_length)
+
+gene_not_master.anno <- left_join( Not_gate_dataframe.filt, MM_targets , by = c("Target_gene" ="gene" ))
+
+Extra_cellular_domain <- data.frame( gene=  df_new$ID, NOT_ECD_length = df_new$largest_extracellular_domain_length)
+
+gene_not_master.anno <- left_join( gene_not_master.anno, Extra_cellular_domain , by = c("not_gate" ="gene" ))
+
+#Get the Essentiality of our Targets 
+
+
+MM_targets_ess <- data.frame( Target_gene =rownames(MM_dep.save), Essentiality = MM_dep.save$Essential )
+
+# filter out the NOT gate combinations that fail the flag
+
+gene_not_master.anno <- left_join( gene_not_master.anno, MM_targets_ess , by = c("Target_gene" ="Target_gene" )) %>% filter(filter == "Yes")
+
+# Get the average expression of the Target genes from the PMP
+
+Target_expression <- data.frame(Target_gene= PMP_uniprot_filtered_ensemblID$`Gene ID`, Expression =  log10(rowMeans(PMP_uniprot_filtered_ensemblID[,20:27]) ))
+
+# merge the expression with the Gene_not_master annotation
+
+gene_not_master.anno <- left_join( gene_not_master.anno, Target_expression, by= c("Target_gene" = "Target_gene" )) %>% distinct()
+
+#write out data
+
+save(gene_not_master.anno, file = "~/Documents/Chapman_work/MAC-STS/gene_not_master.anno.RData")
+save(T_genes, file = "~/Documents/Chapman_work/MAC-STS/T_genes.RData")
+
+```
+
+``` {r heatmap maker}
+library(RColorBrewer)
+
+### Add myeloma expression to the Human Proteome Map
+
+mm.merge <- data.frame(gene = PMP_uniprot_filtered_ensemblID$`Gene ID`, Myeloma = 100)
+
+Tissue_gene_level_exp.master.2  <- left_join(Tissue_gene_level_exp.master,  mm.merge , by= c("Gene" = "gene" ))
+Tissue_gene_level_exp.master.2 <- Tissue_gene_level_exp.master.2 %>% replace(is.na(.), 0)
+
+#### GOI filter
+
+not_matches <- dplyr::filter(gene_not_master.anno, Target_gene == "TFRC" )
+example_matches <- head(not_matches$not_gate, n= 7)
+
+GOI.heatmap <- Tissue_gene_level_exp.master.2  %>% dplyr::filter( Gene == "TFRC")
+NOT.heatmap <- Tissue_gene_level_exp.master.2  %>% dplyr::filter( Gene %in%  example_matches)
+
+ntrns <- NOT.heatmap$Gene
+
+GOI.heatmap<- GOI.heatmap[,-1]
+GOI.heatmap <- as.matrix(GOI.heatmap)
+rownames(GOI.heatmap) <- "TFRC"
+
+NOT.heatmap <- NOT.heatmap[,-1]
+NOT.heatmap <- as.matrix(NOT.heatmap)
+rownames(NOT.heatmap) <-ntrns
+GOI.NOT.MAP <- rbind(GOI.heatmap, NOT.heatmap )
+GOI.NOT.MAP[GOI.NOT.MAP>0] <- 100
+
+heatmap(GOI.NOT.MAP, Colv = NA, Rowv = NA, scale="none", col= colorRampPalette(brewer.pal(8, "Blues"))(25))
+
+
+
+Tissue_gene_level_exp.master.2 <- Tissue_gene_level_exp.master.2 %>% 
+  mutate_if(is.numeric, funs(ifelse(. > 0, 100, .)))
+
+save( Tissue_gene_level_exp.master.2, file = "~/Documents/Chapman_work/MAC-STS/Tissue_gene_level_exp.master.2.RData")
+
+```
+
+# Making a shiny app
+
+Here we construct an App that lets users select the genes of interest based on their extraceullar lenght, it also shows their essentiality.
+This then generates a list of genes which can be used in the NOT gate system and provies a heatmap to which tissues 
+
+```{r}
+library(shiny)
+library(ggplot2)
+library(dplyr)
+library(DT)
+library(RColorBrewer)
+
+load("~/Documents/Chapman_work/MAC-STS/gene_not_master.anno.RData")
+load("~/Documents/Chapman_work/MAC-STS/T_genes.RData")
+load("~/Documents/Chapman_work/MAC-STS/Tissue_gene_level_exp.master.2.RData")
+
+
+# make datasets
+data <- data.frame( Gene = gene_not_master.anno$Target_gene, Score = gene_not_master.anno$Essentiality, ECLength = gene_not_master.anno$Target_ECD_length, expression =gene_not_master.anno$Expression )
+
+data.df <- data %>% unique() %>%  dplyr::arrange(Score)
+data.df <- data.df[order(data.df$Score), ]
+
+
+# Matching dataframe
+matches <- data.frame( Gene= gene_not_master.anno$Target_gene, Match= gene_not_master.anno$not_gate, NOT_ecl_length = gene_not_master.anno$NOT_ECD_length )
+
+# T cell proteins
+
+t_genes_list <- T_genes$gene
+
+
+
+# Define UI
+ui <- fluidPage( 
+  tabsetPanel( 
+    tabPanel("MAC-STS", fluid = TRUE,
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("Myeloma_Target_Expression", "Filter Target genes by Myeloma Plasma Membrane protein expression level:", min = 0, max = 5, value = c(1,2.5), step = 0.2),
+      sliderInput("length_threshold", "Filter Target genes by extra cellular length:", min = 0, max = 2600, value = c(0,250), step = 25),
+      sliderInput("score_threshold", "Filter Target genes by score/essentiality:", min = (-1.5), max = 0.25, value = c(0, 0.25), step = 0.1),
+      selectInput("gene_input", "Select Gene", choices = NULL),
+      textOutput("selected_gene_message"),
+      checkboxInput("omit_tcell_not_gates", "Omit NOT gates expressed on T cells", FALSE)
+    ),
+    mainPanel(
+      plotOutput("gene_plot"),
+      plotOutput("target_expression_plot"),
+      dataTableOutput("match_table"),
+      plotOutput("logic_heatmap")
+    )
+  )
+    ),
+  tabPanel("ABOUT", fluid = TRUE, sidebarLayout(
+    sidebarPanel(),
+    mainPanel(
+      h1("How to use this App"),
+      p("MAC-STS has been designed and developed for Academic use only"),
+      p(),
+      h2("MAC-STS App controls:"),
+      h3("Filter Target genes by Myeloma Plasma Membrane protein expression level:"),
+      p("This selects only genes identified from the plasma membrane proteome of primiary multiple myeloma with the sepecific range. Values are log-normalised without specific units."),
+      p(),
+      h3("Filter Target genes by extra cellular length:"),
+      p("This selects myeloma target genes by length of their extracellular domain. Length is in amino acids. This data is from the Uniprot database."),
+      p(),
+      h3("Filter Target genes by score/essentiality:"),
+      p("This filters the myeloma target gene by its essentiality score in the DepMap. The lower the number the more essential the gene is"),
+      p(),
+      h3("Omit NOT gates expressed on T cells"),
+      p("This removes all NOT- Gate Candidates that are present on T Cells"),
+      p(""),
+      p(""),
+      h2("Contact Details"),
+      p("For all questions regarding this app please email igw24@cam.ac.uk")
+    )
+  )
+)
+           
+           )
+  )
+  
+
+
+# Define server
+server <- function(input, output, session) {
+  
+  # Add new column to data
+  data$ec_length <- runif(nrow(data), 0, 10)
+  
+  # Filter choices based on ec_length and score
+  ec_threshold <- reactive({
+    input$length_threshold
+  })
+  
+  score_threshold <- reactive({
+    input$score_threshold
+  })
+  
+  expression_threshold <-  reactive({
+    input$Myeloma_Target_Expression
+  })
+  
+  
+  choices <- reactive({
+    data %>%
+      filter(ECLength >= ec_threshold()[1],
+             ECLength <= ec_threshold()[2],
+             expression >= expression_threshold()[1],
+             expression <= expression_threshold()[2],
+             Score >= score_threshold()[1],
+             Score <= score_threshold()[2]) %>%
+      pull(Gene) %>%
+      unique()
+  })
+  
+  # Update dropdown menu choices based on extra cellular length threshold and score
+  observe({
+    updateSelectInput(session, "gene_input", choices = choices())
+  })
+  
+  # Get selected gene
+  selected_gene <- reactive({
+    input$gene_input
+  })
+  
+  
+  # Update selected gene when choices change
+  observeEvent(choices(), {
+    if (!is.null(input$gene_input) && !(input$gene_input %in% choices())) {
+      updateSelectInput(session, "gene_input", choices = choices())
+    }
+  })
+  
+  
+  # Generate graph
+  output$gene_plot <- renderPlot({
+    ggplot(data.df, aes(x = reorder(Gene, Score), y = Score)) +
+      geom_point() +
+      ylim(-1, 1) +
+      labs(title = "Myeloma Target Essentiality", x = "Genes", y = "Score") +
+      geom_vline(xintercept = which(data.df$Gene == selected_gene()), color = "red", size = 1) +
+      labs(subtitle = paste("Myeloma Target Gene:", selected_gene()))
+  })
+  
+  # Generate Histogram of Expression 
+  output$target_expression_plot <- renderPlot({
+    ggplot(data.df, aes(x = expression)) +
+      geom_histogram() +
+      xlim(-1, 5) +
+      labs(title = "Myeloma Target Expression", x = "Score", y = "Count") +
+      geom_vline(xintercept = data.df$expression[data.df$Gene == selected_gene()], color = "red", size = 1) +
+      labs(subtitle = paste("Myeloma Target Gene:", selected_gene()))
+  })
+  
+  
+  
+  # Display list of matches
+  output$match_table <- renderDataTable({
+    selected_data <- data %>% filter(Gene == selected_gene()) %>% unique()
+    
+    if (input$omit_tcell_not_gates) {
+      match_data <- matches %>% filter(Gene == selected_gene() & !Match %in% as.list(t_genes_list)) %>% distinct(Match, .keep_all = TRUE)
+    } else {
+      match_data <- matches %>% filter(Gene == selected_gene()) %>% distinct(Match, .keep_all = TRUE)
+    }
+    
+    data.frame(NOT_gate = match_data$Match, NOT_ECL_length =  match_data$NOT_ecl_length)
+  })
+  
+  # Show selected gene message
+  output$selected_gene_message <- renderText({
+    if (!is.null(selected_gene())) {
+      paste("Myeloma target gene is:", selected_gene())
+    } else {
+      ""
+    }
+  })
+  
+  # make the heatmap
+  output$logic_heatmap <- renderPlot({ 
+    
+    
+    selected_data <- data %>% filter(Gene == selected_gene()) %>% unique()
+    
+    
+    if (input$omit_tcell_not_gates) {
+      match_data <- matches %>% filter(Gene == selected_gene() & !Match %in% as.list(t_genes_list)) %>% distinct(Match, .keep_all = TRUE)
+    }else {
+      match_data <- matches %>% filter(Gene == selected_gene()) %>% distinct(Match, .keep_all = TRUE)
+    }
+    
+    match_gene <- data.frame( gene= match_data$Gene[1])
+    NOT_gene <- data.frame(gene = match_data$Match)
+    selected_genes <- rbind(match_gene,NOT_gene)
+    matrix_input <- left_join(selected_genes, Tissue_gene_level_exp.master.2 , by = c("gene" = "Gene" )) %>% distinct()
+    names_map <- matrix_input$gene
+    matrix_input <- as.matrix(matrix_input[,-1])
+    rownames(matrix_input) <- names_map
+    heatmap(matrix_input, Colv = NA, Rowv = NA, scale="none", col= colorRampPalette(brewer.pal(8, "Blues"))(25))
+  })
+  
+  # Update dropdown menu choices based on extra cellular length threshold
+  observe({
+    updateSelectInput(session, "gene_input", choices = unique(data$Gene[data$ECLength >= ec_threshold()]))
+  })
+}
+
+# Run app
+shinyApp(ui, server)
+
+```
+  
+ 
